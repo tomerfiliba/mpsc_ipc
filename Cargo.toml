@@ -1,0 +1,9 @@
+[package]
+name = "mspc_ipc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+libc = "0.2.155"
+memmap = "0.7.0"
