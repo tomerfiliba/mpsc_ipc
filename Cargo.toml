@@ -2,6 +2,8 @@
 name = "mspc_ipc"
 version = "0.1.0"
 edition = "2021"
+license-file = "LICENSE"
+description = "Multi producer single consumer ring buffer for inter-process communication"
 
 [dependencies]
 anyhow = "1.0.86"
