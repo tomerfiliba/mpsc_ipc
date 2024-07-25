@@ -1,4 +1,4 @@
-# MSPC IPC
+# MPSC IPC
 Multi Producer Single Consumer for Inter-Process Communication
 
 All ring-buffer implementations I was able to find assume they operate in a single process. When working 
