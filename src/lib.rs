@@ -13,18 +13,12 @@
 // No-std: the code itself uses std, for things like `anyhow`, but these are all done in the setup phase,
 // when opening and mmaping files. The algorithm itself does not require any runtime or OS support like futex.
 //
-// Control word:
-// +----------+-----------+-------------+
-// | finished |   nonce   |     len     |
-// |    (1)   |    (31)   |     (32)    |
-// +----------+-----------+-------------+
-//
 // Producer: when pushing, the producer checks for room (widx<ridx+num_entries), and if there is room,
 // it attempts to advance widx by 1, using a CAS. If it fails, it tries again. Upon success, it owns slot the slot,
-// and writes the control word using a CAS. The contol word has a nonce part that is unique to each producer,
+// and writes the control word using a CAS. The contol word has a pid part that is unique to each producer,
 // and the length of the data (which must be <= entry_size, and also fit in 32 bits). This CAS writing may fail --
 // which means the consumer has given up on us, in which case some one else might be holding the slot. The
-// nonce ensures we'd be aware of it and bail out. If we succeed in writing the control word, we proceed to
+// pid ensures we'd be aware of it and bail out. If we succeed in writing the control word, we proceed to
 // writing the entry's data (which may take time), followed by rewriting the control word, this time setting the
 // FINISHED bit (only if it matches the expected value).
 //
@@ -37,9 +31,11 @@
 // advancing ridx.
 //
 // The only open issue is a "sleepy producer" that started writing a large entry, hanged until the consumer gave
-// up, and then woke up and continued the memcpy. It will detect the issue and fail when writing the FINISHED bit,
-// but it might have already corrupted an entry being written by another producer. If this happens, the failing
-// producer will overwrite the control word with FINISHED and len=0, so the consumer will silently skip it
+// up, and then woke up and continued the memcpy. In this case, it will corrupt and entry that's already taken by
+// some other producer. To solve that, the stall function takes the producer's pid. It is allowed to wait for
+// any duration or time (returning `Retry`), or to skip the entry while leaving it occupied (`Skip`), as well as
+// clearing the entry (`Reclaim`). Note that `Reclaim` is only safe to use if the producer is dead (or if you
+// can ensure it will never wake up)
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -53,7 +49,7 @@ use std::{fs::OpenOptions, path::Path, slice};
 
 const MAGIC: u32 = 0x2d06_9f03;
 const VERSION: u32 = 1;
-const FINISHED: u64 = 1 << 63;
+const PID_MASK: u32 = 0x7fff_ffff;
 
 fn align(n: u64, alignment: u64) -> u64 {
     ((n + alignment - 1) / alignment) * alignment
@@ -78,11 +74,42 @@ struct RingBufHeader {
     write_idx: AtomicU64,
 }
 
-type ControlWord = AtomicU64;
+// +----------+-----------+-------------+
+// | finished |    pid    |     len     |
+// |    (1)   |    (31)   |     (32)    |
+// +----------+-----------+-------------+
+struct ControlWord(u64);
+
+impl ControlWord {
+    fn new(pid: u32, len: u32) -> Self {
+        Self(((pid as u64) << 32) | (len as u64))
+    }
+    fn load(atomic: &AtomicU64) -> Self {
+        Self(atomic.load(Relaxed))
+    }
+    fn claim(&self, atomic: &AtomicU64) -> bool {
+        atomic.compare_exchange(0, self.0, SeqCst, Relaxed).is_ok()
+    }
+
+    fn len(&self) -> usize {
+        (self.0 as u32) as usize
+    }
+    fn pid(&self) -> u32 {
+        ((self.0 >> 32) as u32) & PID_MASK
+    }
+    fn is_finished(&self) -> bool {
+        self.0 >> 63 != 0
+    }
+    fn mark_finished(&self, atomic: &AtomicU64) -> bool {
+        atomic
+            .compare_exchange(self.0, (1 << 63) | self.0, SeqCst, Relaxed)
+            .is_ok()
+    }
+}
 
 struct RingBuf {
     ptr: *const u8,
-    control_ptr: *const ControlWord,
+    control_ptr: *const AtomicU64,
     entries_ptr: *const u8,
     num_entries: u64,
     entry_size: u64,
@@ -96,7 +123,7 @@ impl RingBuf {
     }
 
     #[inline]
-    fn control_word(&self, idx: u64) -> &ControlWord {
+    fn control_word(&self, idx: u64) -> &AtomicU64 {
         unsafe {
             &*self
                 .control_ptr
@@ -131,6 +158,13 @@ impl RingBuf {
 
 pub struct SingleConsumer {
     ring: RingBuf,
+}
+
+pub enum StallResult {
+    Retry,                // stall (re-check the status of the entry)
+    SkipAndKeepTombstone, // skip this entry, it will be "tombstoned"
+    SkipAndReclaim,       // reclaim (clear) this entry (allow it to be reused) --
+                          // ONLY DO THIS IF THE PRODUCER IS SURELY DEAD
 }
 
 impl SingleConsumer {
@@ -192,7 +226,7 @@ impl SingleConsumer {
                 num_entries,
                 entry_size,
                 control_ptr: unsafe {
-                    mmap.as_ptr().byte_add(control_offset as usize) as *const ControlWord
+                    mmap.as_ptr().byte_add(control_offset as usize) as *const AtomicU64
                 },
                 entries_ptr: unsafe { mmap.as_ptr().byte_add(entries_offset as usize) },
                 _mmap: Some(mmap),
@@ -264,7 +298,7 @@ impl SingleConsumer {
                 num_entries,
                 entry_size,
                 control_ptr: unsafe {
-                    buf.as_ptr().byte_add(control_offset as usize) as *const ControlWord
+                    buf.as_ptr().byte_add(control_offset as usize) as *const AtomicU64
                 },
                 entries_ptr: unsafe { buf.as_ptr().byte_add(entries_offset as usize) },
                 _mmap: None,
@@ -272,7 +306,7 @@ impl SingleConsumer {
         })
     }
 
-    pub fn pop(&self, buf: &mut [u8], mut stall: impl FnMut(usize) -> bool) -> bool {
+    pub fn pop(&self, buf: &mut [u8], mut stall: impl FnMut(u32, usize) -> StallResult) -> bool {
         debug_assert!(buf.len() >= self.ring.entry_size as usize);
         let header = self.ring.header();
         let mut attempt = 0;
@@ -284,27 +318,30 @@ impl SingleConsumer {
                 return false;
             }
             let ctrl = self.ring.control_word(ridx);
-            let ctrl_word = ctrl.load(Relaxed);
+            let ctrl_word = ControlWord::load(ctrl);
 
-            if ctrl_word & FINISHED == 0 {
-                if !stall(attempt) {
-                    // give up on this entry
-                    ctrl.store(0, SeqCst);
-                    header.read_idx.fetch_add(1, Release);
+            if !ctrl_word.is_finished() {
+                match stall(ctrl_word.pid(), attempt) {
+                    StallResult::Retry => { // keep waiting
+                    }
+                    StallResult::SkipAndKeepTombstone => {
+                        // leave this entry occupied and move to the next one
+                        header.read_idx.fetch_add(1, Release);
+                    }
+                    StallResult::SkipAndReclaim => {
+                        // forcefully clear the entry and move to the next one -- should only be done if the caller
+                        // is sure the producer is dead, otherwise the producer might wake up in the future and
+                        // corrupt the entry's buffer (the memcpy part is not atomic)
+                        ctrl.store(0, SeqCst);
+                        header.read_idx.fetch_add(1, Release);
+                    }
                 }
                 attempt += 1;
                 continue;
             }
 
-            let len = (ctrl_word as u32) as usize;
-            if len == 0 {
-                // skip this entry
-                ctrl.store(0, SeqCst);
-                header.read_idx.fetch_add(1, Release);
-                continue;
-            }
-
             let entry = self.ring.entry(ridx);
+            let len = ctrl_word.len();
             debug_assert!(len <= entry.len(), "len={len} entry_size={}", entry.len());
             buf[..len].copy_from_slice(&entry[..len]);
 
@@ -317,17 +354,19 @@ impl SingleConsumer {
 
 pub struct MultiProducer {
     ring: RingBuf,
-    nonce: u64,
+    tid: u32,
 }
 
 impl MultiProducer {
-    fn get_nonce() -> Result<u64> {
-        let mut nonce_buf = [0u8; size_of::<u32>()];
+    fn gettid() -> Result<u32> {
+        let tid = unsafe { libc::gettid() };
+        ensure!(tid > 0, "gettid failed");
+        let tid = tid as u32;
         ensure!(
-            unsafe { libc::getrandom(nonce_buf.as_mut_ptr() as *mut _, nonce_buf.len(), 0) }
-                == nonce_buf.len() as _
+            tid & PID_MASK == tid,
+            "PIDs are expected to have only 24 meaningful bits"
         );
-        Ok(((u32::from_ne_bytes(nonce_buf) & 0x7fff_ffff) as u64) << 32)
+        Ok(tid & PID_MASK)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -342,7 +381,7 @@ impl MultiProducer {
                 control_ptr: unsafe {
                     mmap.as_ptr()
                         .byte_add(header.params.control_offset as usize)
-                        as *const ControlWord
+                        as *const AtomicU64
                 },
                 entries_ptr: unsafe {
                     mmap.as_ptr()
@@ -352,7 +391,7 @@ impl MultiProducer {
                 entry_size: header.params.entry_size,
                 _mmap: Some(mmap),
             },
-            nonce: Self::get_nonce()?,
+            tid: Self::gettid()?,
         })
     }
 
@@ -364,8 +403,7 @@ impl MultiProducer {
             ring: RingBuf {
                 ptr: buf.as_ptr(),
                 control_ptr: unsafe {
-                    buf.as_ptr().byte_add(header.params.control_offset as usize)
-                        as *const ControlWord
+                    buf.as_ptr().byte_add(header.params.control_offset as usize) as *const AtomicU64
                 },
                 entries_ptr: unsafe {
                     buf.as_ptr().byte_add(header.params.entries_offset as usize)
@@ -374,7 +412,7 @@ impl MultiProducer {
                 entry_size: header.params.entry_size,
                 _mmap: None,
             },
-            nonce: Self::get_nonce()?,
+            tid: Self::gettid()?,
         })
     }
 
@@ -397,24 +435,17 @@ impl MultiProducer {
             }
 
             let ctrl = self.ring.control_word(widx);
-            let in_progress = self.nonce | ((data.len() as u64) & 0xffff_ffff);
-            if ctrl
-                .compare_exchange(0, in_progress, SeqCst, Relaxed)
-                .is_err()
-            {
-                return false;
+            let ctrl_word = ControlWord::new(self.tid, data.len() as u32);
+            if !ctrl_word.claim(ctrl) {
+                // this entry is taken (due to another process still holding it), skip for now
+                continue;
             }
             self.ring.entry_mut(widx)[..data.len()].copy_from_slice(data);
 
-            let finished = FINISHED | in_progress;
-            if ctrl
-                .compare_exchange(in_progress, finished, SeqCst, Relaxed)
-                .is_err()
-            {
+            if !ctrl_word.mark_finished(ctrl) {
                 // we may have corrupted an entry now belonging to another producer during the memcpy above
                 // all we can do is signal this case by overwriting the control word to `FINISHED|0` so the
                 // consumer will not read anything from it
-                ctrl.store(FINISHED, SeqCst);
                 return false;
             }
 
@@ -450,9 +481,9 @@ fn test_ring() -> Result<()> {
     let mut res = vec![];
     loop {
         let mut buf = [0u8; 8];
-        while sc.pop(&mut buf, |_| {
+        while sc.pop(&mut buf, |_, _| {
             std::thread::yield_now();
-            true
+            StallResult::Retry
         }) {
             res.push(unsafe { *(buf.as_ptr() as *const usize) });
         }
